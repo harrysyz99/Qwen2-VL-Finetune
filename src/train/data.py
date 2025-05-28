@@ -11,6 +11,7 @@ import re
 
 from .params import DataArguments
 from .constants import *
+from .constants import TASK_TYPE_TO_ID, TASK_CONFIG, TASK_TYPES, IGNORE_INDEX
 
 def truncate_sequence(input_ids, labels, max_length, eos_token_id):
     if input_ids.size(0) > max_length:
@@ -134,6 +135,26 @@ class SupervisedDataset(Dataset):
         is_video = False
 
         processor = self.processor
+        task_type_str = sources.get("task_type")
+        label_value = sources.get("label")
+
+        if task_type_str is None or label_value is None:
+            raise ValueError(f"Sample {i} is missing 'task_type' or 'label'. sources: {sources}")
+
+        task_id = TASK_TYPE_TO_ID.get(task_type_str)
+        if task_id is None:
+            raise ValueError(f"Unknown task_type '{task_type_str}' in sample {i}. Valid types are {list(TASK_TYPE_TO_ID.keys())}")
+
+        current_task_config = TASK_CONFIG[task_type_str]
+
+        classification_target = torch.tensor(IGNORE_INDEX, dtype=torch.long)
+        regression_target = torch.tensor(float(IGNORE_INDEX) if IGNORE_INDEX is not None else 0.0, dtype=torch.float)
+
+        if current_task_config["type"] == "classification":
+            classification_target = torch.tensor(int(label_value), dtype=torch.long)
+        elif current_task_config["type"] == "regression":
+            regression_target = torch.tensor(float(label_value), dtype=torch.float)
+
         if "image" in sources:
             videos = None
             grid_key = "image_grid_thw"
@@ -186,7 +207,6 @@ class SupervisedDataset(Dataset):
         all_image_grid_thw = []
         all_second_gird = []
 
-        # Qwen2-VL uses a default system message so I've added this.
         if len(SYSTEM_MESSAGE) > 0:
             system_message = f"{DEFAULT_IM_START_TOKEN}system\n{SYSTEM_MESSAGE}{DEFAULT_IM_END_TOKEN}\n"
             system_message_input_ids = processor.tokenizer(system_message, add_special_tokens=False, return_tensors='pt')['input_ids']
@@ -235,20 +255,17 @@ class SupervisedDataset(Dataset):
             all_input_ids.append(input_ids)
             all_labels.append(labels)
         
-        # There is no need for eos or bos tokens in the input_ids
-        # Qwen2-VL does not use them
         input_ids = torch.cat(all_input_ids, dim=0).to(torch.long)
         labels = torch.cat(all_labels, dim=0).to(torch.long)
-
-        # eos_token_id = processor.tokenizer.convert_tokens_to_ids(DEFAULT_IM_END_TOKEN)
-        # input_ids, labels = truncate_sequence(input_ids, labels, self.max_length, eos_token_id)
 
         attention_mask = (input_ids > -1000000).to(torch.long)
 
         data_dict = dict(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            labels=labels,
+            task_id_labels=torch.tensor(task_id, dtype=torch.long),
+            classification_labels=classification_target,
+            regression_labels=regression_target,
         )
 
         if pixel_key and grid_key:
@@ -271,7 +288,9 @@ class DataCollatorForSupervisedDataset(object):
 
     def __call__(self, examples):
         batch_input_ids = []
-        batch_label_ids = []
+        batch_task_id_labels = []
+        batch_classification_labels = []
+        batch_regression_labels = []
         batch_pixel_values = []
         batch_pixel_video_values = []
         batch_video_thw = []
@@ -288,7 +307,9 @@ class DataCollatorForSupervisedDataset(object):
                 batch_image_thw.append(example["image_grid_thw"])
             
             batch_input_ids.append(example["input_ids"])
-            batch_label_ids.append(example["labels"])
+            batch_task_id_labels.append(example["task_id_labels"])
+            batch_classification_labels.append(example["classification_labels"])
+            batch_regression_labels.append(example["regression_labels"])
 
             if "second_per_grid_ts" in keys:
                 batch_second_per_grid_ts.extend(example["second_per_grid_ts"])
@@ -298,12 +319,16 @@ class DataCollatorForSupervisedDataset(object):
         )
 
         attention_mask = input_ids != self.pad_token_id
-        labels = pad_sequence(batch_label_ids, padding_side='right', padding_value=IGNORE_INDEX)
+        task_id_labels_batch = torch.stack(batch_task_id_labels)
+        classification_labels_batch = torch.stack(batch_classification_labels)
+        regression_labels_batch = torch.stack(batch_regression_labels)
 
         data_dict = {
             'input_ids': input_ids,
-            'labels': labels,
             'attention_mask': attention_mask,
+            'task_id_labels': task_id_labels_batch,
+            'classification_labels': classification_labels_batch,
+            'regression_labels': regression_labels_batch,
         }
 
         if len(batch_pixel_values) > 0:

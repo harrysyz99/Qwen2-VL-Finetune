@@ -2,7 +2,7 @@ import os
 import torch
 from peft import LoraConfig, get_peft_model
 import ast
-from transformers import AutoProcessor, BitsAndBytesConfig, Qwen2VLForConditionalGeneration, HfArgumentParser, Qwen2_5_VLForConditionalGeneration
+from transformers import AutoProcessor, BitsAndBytesConfig, HfArgumentParser
 from train.trainer import QwenTrainer
 from train.data import make_supervised_data_module
 from train.params import DataArguments, ModelArguments, TrainingArguments
@@ -10,6 +10,8 @@ from train.train_utils import get_peft_state_maybe_zero_3, get_peft_state_non_lo
 import pathlib
 from liger_kernel.transformers import apply_liger_kernel_to_qwen2_vl, apply_liger_kernel_to_qwen2_5_vl
 from monkey_patch_forward import replace_qwen2_5_with_mixed_modality_forward, replace_qwen_2_with_mixed_modality_forward
+from train.multi_head_model import MultiHeadQwenVLForConditionalGeneration
+from train.constants import TASK_CONFIG
 
 local_rank = None
 
@@ -65,19 +67,19 @@ def train():
     
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
     use_liger = training_args.use_liger
+
     if "Qwen2.5" in model_args.model_id:
-        # It monkey patches the forward to handle mixed modality inputs.
-        replace_qwen2_5_with_mixed_modality_forward(use_liger=use_liger)
-        # This is becuase mixed-modality training monkey-patches the model forward method.
-        if use_liger:
-            apply_liger_kernel_to_qwen2_5_vl(fused_linear_cross_entropy=False)
+        if hasattr(transformers.models.qwen2_5_vl.modeling_qwen2_5_vl, 'Qwen2_5_VLForConditionalGeneration'):
+            replace_qwen2_5_with_mixed_modality_forward(use_liger=use_liger)
+            if use_liger:
+                apply_liger_kernel_to_qwen2_5_vl(fused_linear_cross_entropy=False)
+    elif "Qwen2-VL" in model_args.model_id:
+        if hasattr(transformers.models.qwen2_vl.modeling_qwen2_vl, 'Qwen2VLForConditionalGeneration'):
+            replace_qwen_2_with_mixed_modality_forward(use_liger=use_liger)
+            if use_liger:
+                apply_liger_kernel_to_qwen2_vl(fused_linear_cross_entropy=False)
     else:
-        # It monkey patches the forward to handle mixed modality inputs.
-        replace_qwen_2_with_mixed_modality_forward(use_liger=use_liger)
-        # This is becuase mixed-modality training monkey-patches the model forward method.
-        if use_liger:
-            apply_liger_kernel_to_qwen2_vl(fused_linear_cross_entropy=False)
-    
+        rank0_print(f"Warning: Model ID {model_args.model_id} does not clearly specify Qwen2.5 or Qwen2-VL for monkey patching.")
 
     if training_args.lora_enable and not training_args.freeze_llm:
         raise ValueError("If `lora_enable` is True, `freeze_llm` must also be True.")
@@ -117,34 +119,43 @@ def train():
             )
         ))
 
-    if "Qwen2.5" in model_args.model_id:
-        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model_args.model_id,
-            torch_dtype=compute_dtype,
-            attn_implementation="flash_attention_2" if not training_args.disable_flash_attn2 else "sdpa", 
-            **bnb_model_from_pretrained_args
-        )
-    else:
-        model = Qwen2VLForConditionalGeneration.from_pretrained(
-            model_args.model_id,
-            torch_dtype=compute_dtype,
-            attn_implementation="flash_attention_2" if not training_args.disable_flash_attn2 else "sdpa", 
-            **bnb_model_from_pretrained_args
-        )
+    rank0_print(f"Loading MultiHeadQwenVLForConditionalGeneration for model ID: {model_args.model_id}")
+    model = MultiHeadQwenVLForConditionalGeneration.from_pretrained(
+        model_args.model_id,
+        torch_dtype=compute_dtype,
+        attn_implementation="flash_attention_2" if not training_args.disable_flash_attn2 else "sdpa",
+        **bnb_model_from_pretrained_args
+    )
 
     model.config.use_cache = False
-    model_to_configure = model
-    configure_llm(model_to_configure, training_args)
-    configure_vision_tower(model_to_configure, training_args, compute_dtype, training_args.device)
+
+    if training_args.freeze_llm:
+        for name, param in model.model.named_parameters():
+            param.requires_grad = False
+        rank0_print("Froze LLM (base Qwen transformer) parameters.")
+
+    if training_args.freeze_vision_tower:
+        for name, param in model.visual.named_parameters():
+            param.requires_grad = False
+        rank0_print("Froze Vision Tower parameters.")
 
     if training_args.bits in [4,8]:
         model.config.torch_dtype = (torch.float32 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
         from peft import prepare_model_for_kbit_training
+        # Ensure that the model is prepared for k-bit training *before* LoRA is applied if bits are 4 or 8.
+        # If LoRA is also enabled, get_peft_model will be called later.
         model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=training_args.gradient_checkpointing, gradient_checkpointing_kwargs={"use_reentrant": True})
+        rank0_print(f"Prepared model for {training_args.bits}-bit training.")
     
     if training_args.gradient_checkpointing:
-        model.enable_input_require_grads()
-        training_args.gradient_checkpointing_kwargs = {"use_reentrant": True}
+        # This should be called on the model that will be trained.
+        # If LoRA is used, peft model enables this by default if underlying model has it.
+        # If not using LoRA, call it on our model directly.
+        # If using k-bit, prepare_model_for_kbit_training already handles this.
+        if not (training_args.bits in [4,8]): # only if not already handled by kbit
+            model.enable_input_require_grads()
+            training_args.gradient_checkpointing_kwargs = {"use_reentrant": True} # already set by peft if applicable
+            rank0_print("Enabled input require grads for gradient checkpointing.")
 
     if training_args.lora_enable:
         lora_namespan_exclude = training_args.lora_namespan_exclude
@@ -163,38 +174,19 @@ def train():
         rank0_print("Adding LoRA to the model...")
         model = get_peft_model(model, peft_config)
 
-        # Peft maodel makes vision tower and merger freezed again.
-        # Configuring fuction could be called here, but sometimes it does not work properly.
-        # So I just made it this way.
-        # Need to be fixed in the future.
-
         if not training_args.freeze_vision_tower:
             for name, param in model.named_parameters():
                 if "visual" in name:
                     param.requires_grad = True
+            rank0_print("Ensured vision tower params are trainable post-LoRA if not frozen.")
 
         if not training_args.freeze_merger:
             for name, param in model.named_parameters():
-                if "merger" in name:
+                if "visual.merger" in name:
                     param.requires_grad = True
+            rank0_print("Ensured merger params are trainable post-LoRA if not frozen.")
 
     processor = AutoProcessor.from_pretrained(model_args.model_id)
-
-    # model.config.tokenizer_model_max_length = processor.tokenizer.model_max_length
-
-    if training_args.bits in [4, 8]:
-        from peft.tuners.lora import LoraLayer
-        for name, module in model.named_modules():
-            if isinstance(module, LoraLayer):
-                if training_args.bf16:
-                    module = module.to(torch.bfloat16)
-            if 'norm' in name:
-                module = module.to(torch.float32)
-            
-            if 'lm_head' in name or 'embed_token' in name:
-                if hasattr(module, 'weight'):
-                    if training_args.bf16 and module.weight.dtype == torch.float32:
-                        module = module.to(torch.bfloat16)
 
     data_module = make_supervised_data_module(model_id=model_args.model_id,
                                               processor=processor,
